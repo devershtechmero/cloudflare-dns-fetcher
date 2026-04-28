@@ -19,13 +19,17 @@ import { Progress } from "@/components/ui/progress";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { fetchARecords, type BulkResultRow, type BulkRow } from "@/lib/dns";
-import ResultsTable from "./ResultsTable";
-import ExportButton from "./ExportButton";
+import { fetchARecords, type BulkRow, type FetchRecordsResponse } from "@/lib/dns";
 
-const REQUIRED_COLUMNS = ["domain", "zone_id", "email", "api_key"] as const;
+interface ExportRow {
+  domain: string;
+  zone_id: string;
+  email: string;
+  api_key: string;
+  IP: string;
+}
 
-export default function BulkUpload() {
+export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
   const [dragging, setDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [rows, setRows] = useState<BulkRow[]>([]);
@@ -33,63 +37,52 @@ export default function BulkUpload() {
 
   const [processing, setProcessing] = useState(false);
   const [progressIdx, setProgressIdx] = useState(0);
-  const [results, setResults] = useState<BulkResultRow[]>([]);
 
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleFiles = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     const f = files[0];
-    if (!/\.(xlsx|xls)$/i.test(f.name)) {
-      toast.error("Please upload a .xlsx or .xls file");
+    if (!f.name.endsWith(".xlsx") && !f.name.endsWith(".xls")) {
+      setParseError("Please upload an Excel file (.xlsx or .xls)");
       return;
     }
+
     setFile(f);
     setParseError(null);
-    setResults([]);
 
     try {
-      const buf = await f.arrayBuffer();
-      const wb = XLSX.read(buf, { type: "array" });
-      const firstSheet = wb.Sheets[wb.SheetNames[0]];
-      const raw = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, {
-        defval: "",
+      const data = await f.arrayBuffer();
+      const workbook = XLSX.read(data);
+      const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rawRows = XLSX.utils.sheet_to_json<(string | number | boolean)[]>(worksheet, {
+        header: 1,
       });
 
-      if (raw.length === 0) {
-        setParseError("The spreadsheet is empty.");
-        setRows([]);
+      if (rawRows.length === 0) {
+        setParseError("The Excel file is empty.");
         return;
       }
 
-      // Normalize keys: lowercase + trim + collapse spaces to underscore.
-      const normalized = raw.map((row) => {
-        const out: Record<string, string> = {};
-        for (const [k, v] of Object.entries(row)) {
-          const nk = String(k).trim().toLowerCase().replace(/\s+/g, "_");
-          out[nk] = String(v ?? "").trim();
-        }
-        return out;
-      });
-
-      const firstKeys = Object.keys(normalized[0]);
-      const missing = REQUIRED_COLUMNS.filter((c) => !firstKeys.includes(c));
-      if (missing.length > 0) {
-        setParseError(
-          `Missing required column(s): ${missing.join(", ")}. Expected: domain, zone_id, email, api_key.`,
-        );
-        setRows([]);
-        return;
-      }
-
-      const parsed: BulkRow[] = normalized
-        .map((r) => ({
-          domain: r.domain,
-          zone_id: r.zone_id,
-          email: r.email,
-          api_key: r.api_key,
-        }))
+      const parsed: BulkRow[] = rawRows
+        .filter((row) => row.some((cell) => String(cell ?? "").trim() !== ""))
+        .map((row, index) => {
+          if (row.length < 4) {
+            throw new Error(`Row ${index + 1} is missing required values.`);
+          }
+          return {
+            domain: String(row[0] ?? "").trim(),
+            zone_id: String(row[1] ?? "").trim(),
+            email: String(row[2] ?? "").trim(),
+            api_key: String(row[3] ?? "").trim(),
+          };
+        })
         .filter((r) => r.domain || r.zone_id || r.email || r.api_key);
+
+      if (parsed.length === 0) {
+        setParseError("No valid rows found in the uploaded file.");
+        return;
+      }
 
       setRows(parsed);
       toast.success(`Parsed ${parsed.length} row${parsed.length === 1 ? "" : "s"}`);
@@ -108,236 +101,166 @@ export default function BulkUpload() {
   async function processAll() {
     if (rows.length === 0) return;
     setProcessing(true);
-    setResults([]);
     setProgressIdx(0);
 
-    const aggregated: BulkResultRow[] = [];
+    const inputs: BulkRow[] = rows.map((row) => ({
+      domain: row.domain,
+      zoneId: row.zone_id,
+      email: row.email,
+      apiKey: row.api_key,
+    })) as any;
 
-    for (let i = 0; i < rows.length; i++) {
-      setProgressIdx(i + 1);
-      const row = rows[i];
+    try {
+      const responses = (await fetchARecords(inputs as any)) as FetchRecordsResponse[];
 
-      if (!row.domain || !row.zone_id || !row.email || !row.api_key) {
-        aggregated.push({
-          domain: row.domain || `(row ${i + 1})`,
-          type: "",
-          name: "",
-          content: "",
-          ttl: "",
-          proxied: "",
-          status: "Error",
-          error: "Missing one or more required values.",
-        });
-        setResults([...aggregated]);
-        continue;
-      }
+      const outputRows: ExportRow[] = responses.map((response, index) => {
+        const source = rows[index];
+        const ipOrError =
+          response.success && response.records.length > 0
+            ? response.records.map((record) => record.content).join(", ")
+            : response.error || "Cloudflare API error";
 
-      const res = await fetchARecords({
-        domain: row.domain,
-        zoneId: row.zone_id,
-        email: row.email,
-        apiKey: row.api_key,
+        return {
+          domain: source.domain,
+          zone_id: source.zone_id,
+          email: source.email,
+          api_key: source.api_key,
+          IP: ipOrError,
+        };
       });
 
-      if (!res.success) {
-        aggregated.push({
-          domain: row.domain,
-          type: "",
-          name: "",
-          content: "",
-          ttl: "",
-          proxied: "",
-          status: "Error",
-          error: res.error || "Unknown error",
-        });
-      } else if (res.records.length === 0) {
-        aggregated.push({
-          domain: row.domain,
-          type: "",
-          name: "",
-          content: "",
-          ttl: "",
-          proxied: "",
-          status: "Success",
-          error: "No A records found",
-        });
-      } else {
-        for (const rec of res.records) {
-          aggregated.push({
-            domain: row.domain,
-            type: rec.type,
-            name: rec.name,
-            content: rec.content,
-            ttl: rec.ttl,
-            proxied: rec.proxied,
-            status: "Success",
-          });
-        }
-      }
-      setResults([...aggregated]);
-    }
+      const worksheet = XLSX.utils.json_to_sheet(outputRows, {
+        header: ["domain", "zone_id", "email", "api_key", "IP"],
+      });
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, "results");
+      XLSX.writeFile(workbook, `cloudflare_a_records_${Date.now()}.xlsx`);
 
-    setProcessing(false);
-    const errors = aggregated.filter((r) => r.status === "Error").length;
-    if (errors === 0) toast.success("All domains processed successfully");
-    else toast.warning(`Completed with ${errors} error${errors === 1 ? "" : "s"}`);
+      const errors = responses.filter(r => !r.success).length;
+      if (errors === 0) {
+        toast.success(`All ${rows.length} domains processed. Output file downloaded.`);
+      } else {
+        toast.warning(`Processed with ${errors} errors. Check the last row in the downloaded file.`);
+      }
+
+      setProgressIdx(rows.length);
+      if (onSuccess) onSuccess();
+    } catch (error) {
+      toast.error("Bulk processing failed");
+    } finally {
+      setProcessing(false);
+    }
   }
 
-  const progressValue =
-    rows.length > 0 ? Math.round((progressIdx / rows.length) * 100) : 0;
-
   return (
-    <Card className="shadow-card">
-      <CardHeader>
-        <CardTitle>Bulk Excel Upload</CardTitle>
-        <CardDescription>
-          Upload an Excel file with multiple Cloudflare zones and fetch all A
-          records at once.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
-        <div className="rounded-md border border-border bg-accent/40 p-3 text-xs text-accent-foreground">
-          <span className="font-semibold">Expected columns:</span>{" "}
-          <code className="rounded bg-background/60 px-1.5 py-0.5 font-mono">
-            domain
-          </code>{" "}
-          |{" "}
-          <code className="rounded bg-background/60 px-1.5 py-0.5 font-mono">
-            zone_id
-          </code>{" "}
-          |{" "}
-          <code className="rounded bg-background/60 px-1.5 py-0.5 font-mono">
-            email
-          </code>{" "}
-          |{" "}
-          <code className="rounded bg-background/60 px-1.5 py-0.5 font-mono">
-            api_key
-          </code>
-        </div>
-
-        <div
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDragging(true);
-          }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={onDrop}
-          onClick={() => inputRef.current?.click()}
-          className={cn(
-            "flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-border bg-background px-6 py-10 text-center transition-colors hover:border-primary hover:bg-accent/40",
-            dragging && "drag-active",
-          )}
-        >
-          <input
-            ref={inputRef}
-            type="file"
-            accept=".xlsx,.xls"
-            className="hidden"
-            onChange={(e) => handleFiles(e.target.files)}
-          />
-          <UploadCloud className="mb-3 h-10 w-10 text-primary" />
-          <p className="text-sm font-medium text-foreground">
-            Drag & drop your Excel file here
-          </p>
-          <p className="mt-1 text-xs text-muted-foreground">
-            or click to browse — .xlsx or .xls only
-          </p>
-        </div>
-
-        {file && (
-          <div className="flex items-center justify-between rounded-md border border-border bg-muted/40 px-4 py-3 text-sm">
-            <div className="flex items-center gap-3 min-w-0">
-              <FileSpreadsheet className="h-5 w-5 shrink-0 text-primary" />
-              <div className="min-w-0">
-                <p className="truncate font-medium text-foreground">{file.name}</p>
-                <p className="text-xs text-muted-foreground">
-                  {rows.length} valid row{rows.length === 1 ? "" : "s"} detected
-                </p>
-              </div>
+    <div className="space-y-6">
+      <Card className="shadow-card transition-all hover:shadow-elegant">
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <div className="space-y-1">
+              <CardTitle>Bulk Import</CardTitle>
+              <CardDescription>
+                Upload a headerless Excel file in this exact order: domain, zone_id, email, api_key.
+              </CardDescription>
             </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => {
-                setFile(null);
-                setRows([]);
-                setResults([]);
-                setParseError(null);
-                if (inputRef.current) inputRef.current.value = "";
+            <FileSpreadsheet className="h-8 w-8 text-muted-foreground/50" />
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {!file ? (
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragging(true);
               }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={onDrop}
+              onClick={() => inputRef.current?.click()}
+              className={cn(
+                "group flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed p-10 transition-all",
+                dragging
+                  ? "border-primary bg-primary/5"
+                  : "border-muted-foreground/20 hover:border-primary/50 hover:bg-muted/50",
+              )}
             >
-              Remove
-            </Button>
-          </div>
-        )}
-
-        {parseError && (
-          <Alert variant="destructive">
-            <AlertTitle>Invalid file</AlertTitle>
-            <AlertDescription>{parseError}</AlertDescription>
-          </Alert>
-        )}
-
-        <Button
-          variant="cloudflare"
-          className="w-full"
-          disabled={rows.length === 0 || processing}
-          onClick={processAll}
-        >
-          {processing ? (
-            <>
-              <Loader2 className="h-4 w-4 animate-spin" />
-              Processing {progressIdx} of {rows.length} domains...
-            </>
+              <input
+                type="file"
+                ref={inputRef}
+                className="hidden"
+                accept=".xlsx,.xls"
+                onChange={(e) => handleFiles(e.target.files)}
+              />
+              <div className="mb-4 rounded-full bg-muted p-4 group-hover:bg-primary/10 transition-colors">
+                <UploadCloud className="h-8 w-8 text-muted-foreground group-hover:text-primary transition-colors" />
+              </div>
+              <p className="mb-1 text-sm font-medium">Click or drag Excel file here</p>
+              <p className="text-xs text-muted-foreground">.xlsx or .xls up to 10MB</p>
+            </div>
           ) : (
-            <>
-              <Play className="h-4 w-4" />
-              Process All Domains
-            </>
+            <div className="flex items-center justify-between rounded-lg border border-border p-4 bg-muted/30">
+              <div className="flex items-center gap-3">
+                <div className="rounded-md bg-primary/10 p-2 text-primary">
+                  <FileSpreadsheet className="h-5 w-5" />
+                </div>
+                <div>
+                  <p className="text-sm font-medium">{file.name}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {(file.size / 1024).toFixed(1)} KB • {rows.length} rows found
+                  </p>
+                </div>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setFile(null);
+                  setRows([]);
+                }}
+                disabled={processing}
+              >
+                Change
+              </Button>
+            </div>
           )}
-        </Button>
 
-        {processing && (
-          <div className="space-y-1.5">
-            <Progress value={progressValue} />
-            <p className="text-xs text-muted-foreground text-right">
-              {progressValue}%
-            </p>
-          </div>
-        )}
+          {parseError && (
+            <Alert variant="destructive" className="animate-in fade-in zoom-in-95 duration-200">
+              <Inbox className="h-4 w-4" />
+              <AlertTitle>Parse error</AlertTitle>
+              <AlertDescription>{parseError}</AlertDescription>
+            </Alert>
+          )}
 
-        {results.length > 0 ? (
-          <div className="space-y-3 pt-1">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <p className="text-sm text-muted-foreground">
-                Showing{" "}
-                <span className="font-medium text-foreground">
-                  {results.length}
-                </span>{" "}
-                result row{results.length === 1 ? "" : "s"} across{" "}
-                <span className="font-medium text-foreground">
-                  {new Set(results.map((r) => r.domain)).size}
-                </span>{" "}
-                domain(s).
-              </p>
-              <ExportButton rows={results} />
+          <Button
+            variant="cloudflare"
+            className="w-full"
+            disabled={rows.length === 0 || processing}
+            onClick={processAll}
+          >
+            {processing ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                Processing {progressIdx}/{rows.length}...
+              </>
+            ) : (
+              <>
+                <Play className="mr-2 h-4 w-4" />
+                Process {rows.length} Domains
+              </>
+            )}
+          </Button>
+
+          {processing && (
+            <div className="space-y-2 animate-in fade-in slide-in-from-top-1 duration-300">
+              <div className="flex justify-between text-xs text-muted-foreground">
+                <span>Bulk operation in progress...</span>
+                <span>{Math.round((progressIdx / rows.length) * 100)}%</span>
+              </div>
+              <Progress value={(progressIdx / rows.length) * 100} className="h-2" />
             </div>
-            <ResultsTable rows={results} />
-          </div>
-        ) : (
-          !processing && (
-            <div className="flex flex-col items-center justify-center rounded-md border border-dashed border-border p-8 text-center">
-              <Inbox className="mb-2 h-8 w-8 text-muted-foreground" />
-              <p className="text-sm font-medium text-foreground">
-                No results yet
-              </p>
-              <p className="text-xs text-muted-foreground">
-                Upload a spreadsheet and click Process All Domains to begin.
-              </p>
-            </div>
-          )
-        )}
-      </CardContent>
-    </Card>
+          )}
+        </CardContent>
+      </Card>
+    </div>
   );
 }

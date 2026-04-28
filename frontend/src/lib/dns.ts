@@ -1,5 +1,3 @@
-import { supabase } from "@/integrations/supabase/client";
-
 export interface DnsRecord {
   type: string;
   name: string;
@@ -22,31 +20,50 @@ export interface FetchRecordsResponse {
   error?: string;
 }
 
-export async function fetchARecords(
-  input: FetchRecordsInput,
-): Promise<FetchRecordsResponse> {
-  const { data, error } = await supabase.functions.invoke<FetchRecordsResponse>(
-    "fetch-records",
-    { body: input },
-  );
+const API_BASE = "/api/dns";
 
-  if (error) {
+export async function fetchARecords(
+  input: FetchRecordsInput | FetchRecordsInput[],
+): Promise<FetchRecordsResponse | FetchRecordsResponse[]> {
+  try {
+    const response = await fetch(`${API_BASE}/fetch`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+
+    const data = await response.json();
+    return data;
+  } catch (error: any) {
+    if (Array.isArray(input)) {
+      return input.map((i) => ({
+        success: false,
+        domain: i.domain,
+        records: [],
+        error: error.message || "Network error",
+      }));
+    }
     return {
       success: false,
-      domain: input.domain,
+      domain: (input as FetchRecordsInput).domain,
       records: [],
       error: error.message || "Network error",
     };
   }
-  if (!data) {
-    return {
-      success: false,
-      domain: input.domain,
-      records: [],
-      error: "Empty response from server",
-    };
-  }
-  return data;
+}
+
+export async function fetchHistory() {
+  const response = await fetch(`${API_BASE}/history`);
+  return await response.json();
+}
+
+export async function clearHistory() {
+  const response = await fetch(`${API_BASE}/history`, {
+    method: "DELETE",
+  });
+  return await response.json();
 }
 
 export interface BulkRow {

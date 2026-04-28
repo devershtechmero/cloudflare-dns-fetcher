@@ -6,6 +6,7 @@ import { jwtPlugin } from "./plugins/jwt.js";
 import { mongodbPlugin } from "./plugins/mongodb.js";
 import { authRoutes } from "./routes/auth.js";
 import { healthRoutes } from "./routes/health.js";
+import { dnsRoutes } from "./routes/dns.js";
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const frontendDistPath = path.resolve(currentDir, "../../frontend/dist");
@@ -22,6 +23,7 @@ export async function buildApp() {
     async (api) => {
       await api.register(healthRoutes);
       await api.register(authRoutes);
+      await api.register(dnsRoutes, { prefix: "/dns" });
     },
     { prefix: "/api" }
   );
