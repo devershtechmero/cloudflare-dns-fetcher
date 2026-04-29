@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 import {
+  Download,
   FileSpreadsheet,
   Inbox,
   Loader2,
@@ -8,6 +9,7 @@ import {
   UploadCloud,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Card,
   CardContent,
@@ -17,6 +19,14 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { fetchARecords, type BulkRow, type FetchRecordsResponse } from "@/lib/dns";
@@ -37,6 +47,8 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
 
   const [processing, setProcessing] = useState(false);
   const [progressIdx, setProgressIdx] = useState(0);
+  const [previewRows, setPreviewRows] = useState<ExportRow[]>([]);
+  const [downloadFileName, setDownloadFileName] = useState("cloudflare_a_records");
 
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -50,6 +62,8 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
 
     setFile(f);
     setParseError(null);
+    setPreviewRows([]);
+    setDownloadFileName(`cloudflare_a_records_${Date.now()}`);
 
     try {
       const data = await f.arrayBuffer();
@@ -129,18 +143,13 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
         };
       });
 
-      const worksheet = XLSX.utils.json_to_sheet(outputRows, {
-        header: ["domain", "zone_id", "email", "api_key", "IP"],
-      });
-      const workbook = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(workbook, worksheet, "results");
-      XLSX.writeFile(workbook, `cloudflare_a_records_${Date.now()}.xlsx`);
+      setPreviewRows(outputRows);
 
-      const errors = responses.filter(r => !r.success).length;
+      const errors = responses.filter((r) => !r.success).length;
       if (errors === 0) {
-        toast.success(`All ${rows.length} domains processed. Output file downloaded.`);
+        toast.success(`All ${rows.length} domains processed. Review and download the file.`);
       } else {
-        toast.warning(`Processed with ${errors} errors. Check the last row in the downloaded file.`);
+        toast.warning(`Processed with ${errors} errors. Review the preview before download.`);
       }
 
       setProgressIdx(rows.length);
@@ -150,6 +159,31 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
     } finally {
       setProcessing(false);
     }
+  }
+
+  function downloadPreview() {
+    if (previewRows.length === 0) return;
+    const sanitized = downloadFileName.trim() || "cloudflare_a_records";
+    const finalName = sanitized.toLowerCase().endsWith(".xlsx")
+      ? sanitized
+      : `${sanitized}.xlsx`;
+
+    const worksheet = XLSX.utils.json_to_sheet(previewRows, {
+      header: ["domain", "zone_id", "email", "api_key", "IP"],
+    });
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "results");
+    XLSX.writeFile(workbook, finalName);
+
+    setPreviewRows([]);
+    setFile(null);
+    setRows([]);
+    setProgressIdx(0);
+    setDownloadFileName("cloudflare_a_records");
+    if (inputRef.current) {
+      inputRef.current.value = "";
+    }
+    toast.success("File downloaded and cleared from dashboard preview.");
   }
 
   return (
@@ -215,6 +249,7 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
                 onClick={() => {
                   setFile(null);
                   setRows([]);
+                  setPreviewRows([]);
                 }}
                 disabled={processing}
               >
@@ -257,6 +292,49 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
                 <span>{Math.round((progressIdx / rows.length) * 100)}%</span>
               </div>
               <Progress value={(progressIdx / rows.length) * 100} className="h-2" />
+            </div>
+          )}
+
+          {previewRows.length > 0 && (
+            <div className="space-y-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                <div className="w-full sm:max-w-sm space-y-1.5">
+                  <p className="text-sm font-medium">Preview before download</p>
+                  <Input
+                    value={downloadFileName}
+                    onChange={(e) => setDownloadFileName(e.target.value)}
+                    placeholder="Enter file name"
+                  />
+                </div>
+                <Button variant="cloudflare" onClick={downloadPreview}>
+                  <Download className="mr-2 h-4 w-4" />
+                  Download Sheet
+                </Button>
+              </div>
+              <div className="max-h-80 overflow-auto rounded-md border border-border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Domain</TableHead>
+                      <TableHead>Zone ID</TableHead>
+                      <TableHead>Email</TableHead>
+                      <TableHead>API Key</TableHead>
+                      <TableHead>IP</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {previewRows.map((row, index) => (
+                      <TableRow key={`${row.domain}-${index}`}>
+                        <TableCell>{row.domain}</TableCell>
+                        <TableCell>{row.zone_id}</TableCell>
+                        <TableCell>{row.email}</TableCell>
+                        <TableCell className="font-mono text-xs">{row.api_key}</TableCell>
+                        <TableCell>{row.IP}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
             </div>
           )}
         </CardContent>
