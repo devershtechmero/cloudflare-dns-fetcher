@@ -12,11 +12,22 @@ export interface FetchRecordsInput {
   email: string;
   apiKey: string;
 }
+export interface ReplaceARecordInput extends FetchRecordsInput {
+  ip: string;
+}
 
 export interface FetchRecordsResponse {
   success: boolean;
   domain: string;
   records: DnsRecord[];
+  error?: string;
+}
+export interface ReplaceARecordResponse {
+  success: boolean;
+  domain: string;
+  ip: string;
+  proxied?: boolean;
+  updatedCount: number;
   error?: string;
 }
 
@@ -51,6 +62,31 @@ export async function fetchARecords(
       records: [],
       error: error.message || "Network error",
     };
+  }
+}
+
+export async function replaceARecords(
+  input: ReplaceARecordInput[],
+): Promise<ReplaceARecordResponse[]> {
+  try {
+    const response = await fetch(`${API_BASE}/replace-a-records`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+
+    const data = await response.json();
+    return Array.isArray(data) ? data : [];
+  } catch (error: any) {
+    return input.map((i) => ({
+      success: false,
+      domain: i.domain,
+      ip: i.ip,
+      updatedCount: 0,
+      error: error.message || "Network error",
+    }));
   }
 }
 

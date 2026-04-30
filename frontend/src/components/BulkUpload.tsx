@@ -29,7 +29,16 @@ import {
 } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { fetchARecords, type BulkRow, type FetchRecordsResponse } from "@/lib/dns";
+import {
+  fetchARecords,
+  replaceARecords,
+  type BulkRow,
+  type FetchRecordsResponse,
+} from "@/lib/dns";
+
+type Mode = "fetch" | "replace";
+
+type UploadRow = BulkRow & { ip?: string };
 
 interface ExportRow {
   domain: string;
@@ -37,12 +46,28 @@ interface ExportRow {
   email: string;
   api_key: string;
   IP: string;
+  proxied?: string;
 }
 
-export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
+function splitSingleCellRow(value: string): string[] {
+  if (value.includes(",")) return value.split(",").map((v) => v.trim());
+  if (value.includes(";")) return value.split(";").map((v) => v.trim());
+  if (value.includes("\t")) return value.split("\t").map((v) => v.trim());
+  if (value.includes("|")) return value.split("|").map((v) => v.trim());
+  return [value.trim()];
+}
+
+export default function BulkUpload({
+  onSuccess,
+  initialMode = "fetch",
+}: {
+  onSuccess?: () => void;
+  initialMode?: Mode;
+}) {
+  const [mode, setMode] = useState<Mode>(initialMode);
   const [dragging, setDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
-  const [rows, setRows] = useState<BulkRow[]>([]);
+  const [rows, setRows] = useState<UploadRow[]>([]);
   const [parseError, setParseError] = useState<string | null>(null);
 
   const [processing, setProcessing] = useState(false);
@@ -55,56 +80,95 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
   const handleFiles = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     const f = files[0];
-    if (!f.name.endsWith(".xlsx") && !f.name.endsWith(".xls")) {
-      setParseError("Please upload an Excel file (.xlsx or .xls)");
+    const lowerName = f.name.toLowerCase();
+    if (!lowerName.endsWith(".xlsx") && !lowerName.endsWith(".xls") && !lowerName.endsWith(".csv")) {
+      setParseError("Please upload .xlsx, .xls, or .csv file.");
       return;
     }
 
     setFile(f);
     setParseError(null);
     setPreviewRows([]);
+    setProgressIdx(0);
     setDownloadFileName(`cloudflare_a_records_${Date.now()}`);
 
     try {
-      const data = await f.arrayBuffer();
-      const workbook = XLSX.read(data);
-      const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+      let workbook: XLSX.WorkBook;
+      if (lowerName.endsWith(".csv")) {
+        workbook = XLSX.read(await f.text(), { type: "string" });
+      } else {
+        workbook = XLSX.read(await f.arrayBuffer(), { type: "array" });
+      }
+
+      const firstSheetName = workbook.SheetNames[0];
+      if (!firstSheetName) {
+        setParseError("No worksheet found in uploaded file.");
+        setRows([]);
+        return;
+      }
+
+      const worksheet = workbook.Sheets[firstSheetName];
       const rawRows = XLSX.utils.sheet_to_json<(string | number | boolean)[]>(worksheet, {
         header: 1,
       });
 
       if (rawRows.length === 0) {
-        setParseError("The Excel file is empty.");
+        setParseError("The file is empty.");
+        setRows([]);
         return;
       }
 
-      const parsed: BulkRow[] = rawRows
+      let skippedRows = 0;
+      const parsed: UploadRow[] = rawRows
         .filter((row) => row.some((cell) => String(cell ?? "").trim() !== ""))
-        .map((row, index) => {
-          if (row.length < 4) {
-            throw new Error(`Row ${index + 1} is missing required values.`);
-          }
-          return {
-            domain: String(row[0] ?? "").trim(),
-            zone_id: String(row[1] ?? "").trim(),
-            email: String(row[2] ?? "").trim(),
-            api_key: String(row[3] ?? "").trim(),
-          };
+        .map((row) => row.map((cell) => String(cell ?? "").trim()))
+        .map((cells) => (cells.length === 1 ? splitSingleCellRow(cells[0]) : cells))
+        .filter((cells) => {
+          const minCols = mode === "replace" ? 5 : 4;
+          const ok = cells.length >= minCols;
+          if (!ok) skippedRows += 1;
+          return ok;
         })
-        .filter((r) => r.domain || r.zone_id || r.email || r.api_key);
+        .map((cells) => ({
+          domain: cells[0] ?? "",
+          zone_id: cells[1] ?? "",
+          email: cells[2] ?? "",
+          api_key: cells[3] ?? "",
+          ip: mode === "replace" ? (cells[4] ?? "") : undefined,
+        }))
+        .filter((r) => (mode === "replace"
+          ? r.domain || r.zone_id || r.email || r.api_key || r.ip
+          : r.domain || r.zone_id || r.email || r.api_key));
 
       if (parsed.length === 0) {
-        setParseError("No valid rows found in the uploaded file.");
+        setParseError(
+          mode === "replace"
+            ? "No valid rows found. Expected: domain, zone_id, email, api_key, IP"
+            : "No valid rows found. Expected: domain, zone_id, email, api_key",
+        );
+        setRows([]);
         return;
       }
 
       setRows(parsed);
-      toast.success(`Parsed ${parsed.length} row${parsed.length === 1 ? "" : "s"}`);
-    } catch {
-      setParseError("Could not read the file. Is it a valid Excel workbook?");
+      toast.success(`Parsed ${parsed.length} row${parsed.length === 1 ? "" : "s"}.`);
+      if (skippedRows > 0) {
+        toast.warning(`Skipped ${skippedRows} invalid row${skippedRows === 1 ? "" : "s"}.`);
+      }
+    } catch (error: any) {
+      setParseError(`Could not read file${error?.message ? ` (${error.message})` : ""}`);
       setRows([]);
     }
-  }, []);
+  }, [mode]);
+
+  function resetUpload() {
+    setFile(null);
+    setRows([]);
+    setPreviewRows([]);
+    setParseError(null);
+    setProgressIdx(0);
+    if (inputRef.current) inputRef.current.value = "";
+  }
 
   function onDrop(e: React.DragEvent<HTMLDivElement>) {
     e.preventDefault();
@@ -112,50 +176,76 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
     handleFiles(e.dataTransfer.files);
   }
 
-  async function processAll() {
+  async function runBulk() {
     if (rows.length === 0) return;
     setProcessing(true);
     setProgressIdx(0);
 
-    const inputs: BulkRow[] = rows.map((row) => ({
-      domain: row.domain,
-      zoneId: row.zone_id,
-      email: row.email,
-      apiKey: row.api_key,
-    })) as any;
-
     try {
-      const responses = (await fetchARecords(inputs as any)) as FetchRecordsResponse[];
+      if (mode === "fetch") {
+        const inputs = rows.map((row) => ({
+          domain: row.domain,
+          zoneId: row.zone_id,
+          email: row.email,
+          apiKey: row.api_key,
+        }));
 
-      const outputRows: ExportRow[] = responses.map((response, index) => {
-        const source = rows[index];
-        const ipOrError =
-          response.success && response.records.length > 0
-            ? response.records.map((record) => record.content).join(", ")
-            : response.error || "Cloudflare API error";
+        const responses = (await fetchARecords(inputs as any)) as FetchRecordsResponse[];
+        const outputRows: ExportRow[] = responses.map((response, index) => {
+          const source = rows[index];
+          const ipOrError =
+            response.success && response.records.length > 0
+              ? response.records.map((record) => record.content).join(", ")
+              : response.error || "Cloudflare API error";
 
-        return {
-          domain: source.domain,
-          zone_id: source.zone_id,
-          email: source.email,
-          api_key: source.api_key,
-          IP: ipOrError,
-        };
-      });
+          return {
+            domain: source.domain,
+            zone_id: source.zone_id,
+            email: source.email,
+            api_key: source.api_key,
+            IP: ipOrError,
+          };
+        });
 
-      setPreviewRows(outputRows);
+        setPreviewRows(outputRows);
 
-      const errors = responses.filter((r) => !r.success).length;
-      if (errors === 0) {
-        toast.success(`All ${rows.length} domains processed. Review and download the file.`);
+        const errors = responses.filter((r) => !r.success).length;
+        if (errors === 0) toast.success(`Fetched A records for all ${rows.length} domains.`);
+        else toast.warning(`Fetch completed with ${errors} errors.`);
       } else {
-        toast.warning(`Processed with ${errors} errors. Review the preview before download.`);
+        const responses = await replaceARecords(
+          rows.map((row) => ({
+            domain: row.domain,
+            zoneId: row.zone_id,
+            email: row.email,
+            apiKey: row.api_key,
+            ip: row.ip || "",
+          })),
+        );
+
+        const outputRows: ExportRow[] = responses.map((response, index) => {
+          const source = rows[index];
+          return {
+            domain: source.domain,
+            zone_id: source.zone_id,
+            email: source.email,
+            api_key: source.api_key,
+            IP: response.success ? response.ip : response.error || "Cloudflare API error",
+            proxied: response.success ? String(response.proxied ?? false) : "unknown",
+          };
+        });
+
+        setPreviewRows(outputRows);
+
+        const errors = responses.filter((r) => !r.success).length;
+        if (errors === 0) toast.success(`Updated A records for all ${rows.length} domains.`);
+        else toast.warning(`Update completed with ${errors} errors.`);
       }
 
       setProgressIdx(rows.length);
       if (onSuccess) onSuccess();
-    } catch (error) {
-      toast.error("Bulk processing failed");
+    } catch {
+      toast.error(mode === "fetch" ? "Bulk fetch failed" : "Bulk update failed");
     } finally {
       setProcessing(false);
     }
@@ -164,38 +254,58 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
   function downloadPreview() {
     if (previewRows.length === 0) return;
     const sanitized = downloadFileName.trim() || "cloudflare_a_records";
-    const finalName = sanitized.toLowerCase().endsWith(".xlsx")
-      ? sanitized
-      : `${sanitized}.xlsx`;
+    const finalName = sanitized.toLowerCase().endsWith(".xlsx") ? sanitized : `${sanitized}.xlsx`;
 
-    const worksheet = XLSX.utils.json_to_sheet(previewRows, {
-      header: ["domain", "zone_id", "email", "api_key", "IP"],
-    });
+    const header = mode === "replace"
+      ? ["domain", "zone_id", "email", "api_key", "IP", "proxied"]
+      : ["domain", "zone_id", "email", "api_key", "IP"];
+
+    const worksheet = XLSX.utils.json_to_sheet(previewRows, { header });
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, worksheet, "results");
     XLSX.writeFile(workbook, finalName);
 
-    setPreviewRows([]);
-    setFile(null);
-    setRows([]);
-    setProgressIdx(0);
+    resetUpload();
     setDownloadFileName("cloudflare_a_records");
-    if (inputRef.current) {
-      inputRef.current.value = "";
-    }
-    toast.success("File downloaded and cleared from dashboard preview.");
+    toast.success("Sheet downloaded.");
   }
 
   return (
     <div className="space-y-6">
       <Card className="shadow-card transition-all hover:shadow-elegant">
         <CardHeader>
-          <div className="flex items-center justify-between">
-            <div className="space-y-1">
-              <CardTitle>Bulk Import</CardTitle>
+          <div className="flex items-center justify-between gap-3">
+            <div className="space-y-2">
+              <CardTitle>Bulk DNS Operations</CardTitle>
               <CardDescription>
-                Upload a headerless Excel file in this exact order: domain, zone_id, email, api_key.
+                {mode === "fetch"
+                  ? "Feature 1: Upload headerless rows as domain, zone_id, email, api_key to fetch current A record IPs."
+                  : "Feature 2: Upload headerless rows as domain, zone_id, email, api_key, IP to update A records and return proxied."}
               </CardDescription>
+              <div className="flex flex-wrap gap-2 pt-1">
+                <Button
+                  variant={mode === "fetch" ? "cloudflare" : "outline"}
+                  size="sm"
+                  disabled={processing}
+                  onClick={() => {
+                    setMode("fetch");
+                    resetUpload();
+                  }}
+                >
+                  1. Fetch A Records
+                </Button>
+                <Button
+                  variant={mode === "replace" ? "cloudflare" : "outline"}
+                  size="sm"
+                  disabled={processing}
+                  onClick={() => {
+                    setMode("replace");
+                    resetUpload();
+                  }}
+                >
+                  2. Update A Records
+                </Button>
+              </div>
             </div>
             <FileSpreadsheet className="h-8 w-8 text-muted-foreground/50" />
           </div>
@@ -221,14 +331,14 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
                 type="file"
                 ref={inputRef}
                 className="hidden"
-                accept=".xlsx,.xls"
+                accept=".xlsx,.xls,.csv"
                 onChange={(e) => handleFiles(e.target.files)}
               />
               <div className="mb-4 rounded-full bg-muted p-4 group-hover:bg-primary/10 transition-colors">
                 <UploadCloud className="h-8 w-8 text-muted-foreground group-hover:text-primary transition-colors" />
               </div>
-              <p className="mb-1 text-sm font-medium">Click or drag Excel file here</p>
-              <p className="text-xs text-muted-foreground">.xlsx or .xls up to 10MB</p>
+              <p className="mb-1 text-sm font-medium">Click or drag file here</p>
+              <p className="text-xs text-muted-foreground">.xlsx, .xls, .csv</p>
             </div>
           ) : (
             <div className="flex items-center justify-between rounded-lg border border-border p-4 bg-muted/30">
@@ -243,16 +353,7 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
                   </p>
                 </div>
               </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  setFile(null);
-                  setRows([]);
-                  setPreviewRows([]);
-                }}
-                disabled={processing}
-              >
+              <Button variant="ghost" size="sm" onClick={resetUpload} disabled={processing}>
                 Change
               </Button>
             </div>
@@ -270,7 +371,7 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
             variant="cloudflare"
             className="w-full"
             disabled={rows.length === 0 || processing}
-            onClick={processAll}
+            onClick={runBulk}
           >
             {processing ? (
               <>
@@ -280,7 +381,7 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
             ) : (
               <>
                 <Play className="mr-2 h-4 w-4" />
-                Process {rows.length} Domains
+                {mode === "fetch" ? `Fetch ${rows.length} Domains` : `Update ${rows.length} Domains`}
               </>
             )}
           </Button>
@@ -288,7 +389,7 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
           {processing && (
             <div className="space-y-2 animate-in fade-in slide-in-from-top-1 duration-300">
               <div className="flex justify-between text-xs text-muted-foreground">
-                <span>Bulk operation in progress...</span>
+                <span>{mode === "fetch" ? "Bulk fetch in progress..." : "Bulk update in progress..."}</span>
                 <span>{Math.round((progressIdx / rows.length) * 100)}%</span>
               </div>
               <Progress value={(progressIdx / rows.length) * 100} className="h-2" />
@@ -320,6 +421,7 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
                       <TableHead>Email</TableHead>
                       <TableHead>API Key</TableHead>
                       <TableHead>IP</TableHead>
+                      {mode === "replace" && <TableHead>Proxied</TableHead>}
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -330,6 +432,7 @@ export default function BulkUpload({ onSuccess }: { onSuccess?: () => void }) {
                         <TableCell>{row.email}</TableCell>
                         <TableCell className="font-mono text-xs">{row.api_key}</TableCell>
                         <TableCell>{row.IP}</TableCell>
+                        {mode === "replace" && <TableCell>{row.proxied}</TableCell>}
                       </TableRow>
                     ))}
                   </TableBody>

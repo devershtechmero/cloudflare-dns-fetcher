@@ -3,7 +3,6 @@ import fastifyStatic from "@fastify/static";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { jwtPlugin } from "./plugins/jwt.js";
-import { mongodbPlugin } from "./plugins/mongodb.js";
 import { authRoutes } from "./routes/auth.js";
 import { healthRoutes } from "./routes/health.js";
 import { dnsRoutes } from "./routes/dns.js";
@@ -17,7 +16,6 @@ export async function buildApp() {
     pluginTimeout: 20000,
   });
 
-  await app.register(mongodbPlugin);
   await app.register(jwtPlugin);
   await app.register(
     async (api) => {

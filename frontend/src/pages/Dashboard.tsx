@@ -11,6 +11,7 @@ import { fetchHistory, type DnsRecord } from "@/lib/dns";
 import * as XLSX from "xlsx";
 
 type Mode = "bulk" | null;
+type BulkMode = "fetch" | "replace";
 
 interface HistoryItem {
   _id: string;
@@ -22,6 +23,7 @@ interface HistoryItem {
 
 export default function Dashboard() {
   const [mode, setMode] = useState<Mode>(null);
+  const [bulkMode, setBulkMode] = useState<BulkMode>("fetch");
   const [recentHistory, setRecentHistory] = useState<HistoryItem[]>([]);
   const navigate = useNavigate();
 
@@ -56,9 +58,26 @@ export default function Dashboard() {
           </div>
           <div className="flex gap-2">
             {mode === null && (
-              <Button variant="cloudflare" onClick={() => setMode("bulk")}>
-                Bulk Import
-              </Button>
+              <>
+                <Button
+                  variant="cloudflare"
+                  onClick={() => {
+                    setBulkMode("fetch");
+                    setMode("bulk");
+                  }}
+                >
+                  Fetch A Records
+                </Button>
+                <Button
+                  variant="cloudflare"
+                  onClick={() => {
+                    setBulkMode("replace");
+                    setMode("bulk");
+                  }}
+                >
+                  Update A Records
+                </Button>
+              </>
             )}
             {mode !== null && (
               <Button variant="ghost" onClick={() => setMode(null)}>
@@ -137,7 +156,7 @@ export default function Dashboard() {
 
         {mode === "bulk" && (
           <div className="animate-fade-in">
-            <BulkUpload onSuccess={loadRecentHistory} />
+            <BulkUpload initialMode={bulkMode} onSuccess={loadRecentHistory} />
           </div>
         )}
       </div>
